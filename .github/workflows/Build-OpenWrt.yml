@@ -31,6 +31,10 @@ on:
         required: false
         type: boolean
         default: false
+      remove_wifi_packages:
+        required: false
+        type: boolean
+        default: false
       rename_qualcommax_to_nowifi:
         required: false
         type: boolean
@@ -259,7 +263,58 @@ jobs:
         if [ "${{ inputs.remove_sqm_scripts_nss }}" = "true" ]; then
           sed -i '/CONFIG_PACKAGE_sqm-scripts-nss=y/d' .config
         fi
+
+        # 在 make defconfig 之前，直接从 OpenWrt 源码树（本 CI 运行期的临时 checkout，不改动本仓库）剔除
+        # qualcommax/ipq60xx 的 Wi-Fi 默认包。原因：这些包是 target 级 DEFAULT_PACKAGES（被 select），
+        # 仅用 post-defconfig 的 .config sed 无法持久生效——OpenWrt 在 make download / make 阶段会再次跑
+        # defconfig，把被 select 的包重新拉回 =m，导致 kmod-mac80211 重新被构建、qmi_helpers.ko 缺失等错误。
+        # 只有从源头 target.mk 去掉，defconfig 才不会包含它们，构建期再定稿也拉不回来。这是原仓库能编过的真正做法。
+        if [ "${{ inputs.remove_wifi_packages }}" = "true" ]; then
+          echo "Removing Wi-Fi packages from OpenWrt target Makefiles (CI checkout only)"
+          for file in \
+            target/linux/qualcommax/Makefile \
+            target/linux/qualcommax/ipq60xx/target.mk \
+            target/linux/qualcommax/image/ipq60xx.mk; do
+            [ -f "$file" ] || continue
+            for pkg in wpad-openssl hostapd-common kmod-ath kmod-ath11k kmod-ath11k-ahb kmod-ath11k-pci kmod-cfg80211 kmod-mac80211 kmod-qca-nss-drv-wifi-meshmgr ath11k-firmware-ipq6018 ath11k-firmware-qcn9074 ipq-wifi-zn_m2 wireless-regdb iw wifi-scripts ucode-mod-nl80211; do
+              sed -i -E "s/(^|[[:space:]])${pkg}([[:space:]]|\$)/\1\2/g" "$file"
+            done
+          done
+        fi
         make defconfig
+
+        # 双保险（次要）：上面 make defconfig 之前的 source sed 已经从 target.mk 剔除了被 select 的 Wi-Fi
+        # 默认包，defconfig 不会再包含它们；此处再对生成的 .config 做一遍 Patch，并固化内核级 80211 符号
+        # （CONFIG_WLAN/CFG80211/MAC80211=n），纯粹是防御性兜底 + 供下方校验 grep 使用。
+        # 注意：NSS 的 Wi-Fi offload（NSS_DRV_WIFIOFFLOAD_ENABLE 等）必须保持开启——kmod-qca-nss-drv
+        # 只有在开启时才导出 nss_wifili_* / nss_wifi_vdev_* 符号，qca-nss-gre/netlink/match/mirror 等
+        # clients 模块在 modpost 阶段依赖这些符号；一旦关闭就会报 "undefined!" 链接错误。这些符号只是
+        # NSS 数据面卸载的软件接口，并不包含真实无线收发能力，关掉它们反而会破坏构建。真正要去的无线是
+        # ath11k 驱动 + 固件 + wpad/hostapd + cfg80211/mac80211 内核栈；kmod-qca-nss-drv-wifi-meshmgr
+        # 仅是 DEFAULT_PACKAGES 里的普通包（非驱动硬选），可被移除且不回弹，参考 manifest 亦不含它。
+        # libiwinfo* / rpcd-mod-iwinfo 也保留：它们只是 luci 状态展示库，参考 manifest 含之，无关收发。
+        if [ "${{ inputs.remove_wifi_packages }}" = "true" ]; then
+          echo "Removing Wi-Fi packages from generated .config"
+          for sym in kmod-ath kmod-ath11k kmod-ath11k-ahb kmod-ath11k-pci kmod-cfg80211 kmod-mac80211 kmod-qca-nss-drv-wifi-meshmgr ath11k-firmware-ipq6018 ath11k-firmware-qcn9074 ipq-wifi-zn_m2 wireless-regdb wpad-openssl hostapd-common iw wifi-scripts ucode-mod-nl80211; do
+            sed -i "s/^CONFIG_PACKAGE_${sym}=[my]\$/# CONFIG_PACKAGE_${sym} is not set/" .config
+          done
+          for sym in WLAN CFG80211 MAC80211; do
+            sed -i "s/^CONFIG_${sym}=[my]\$/# CONFIG_${sym} is not set/" .config
+          done
+        fi
+
+        wifi_symbols='CONFIG_PACKAGE_kmod-ath CONFIG_PACKAGE_kmod-ath11k CONFIG_PACKAGE_kmod-ath11k-ahb CONFIG_PACKAGE_kmod-ath11k-pci CONFIG_PACKAGE_kmod-cfg80211 CONFIG_PACKAGE_kmod-mac80211 CONFIG_PACKAGE_kmod-qca-nss-drv-wifi-meshmgr CONFIG_PACKAGE_ath11k-firmware-ipq6018 CONFIG_PACKAGE_ath11k-firmware-qcn9074 CONFIG_PACKAGE_ipq-wifi-zn_m2 CONFIG_PACKAGE_wireless-regdb CONFIG_PACKAGE_wpad-openssl CONFIG_PACKAGE_hostapd-common CONFIG_PACKAGE_iw CONFIG_PACKAGE_wifi-scripts CONFIG_PACKAGE_ucode-mod-nl80211'
+        wifi_enabled=0
+        for symbol in $wifi_symbols; do
+          value="$(grep -E "^${symbol}=[ym]$" .config || true)"
+          if [ -n "$value" ]; then
+            echo "Error: Wi-Fi package is enabled after defconfig: $value" >&2
+            wifi_enabled=1
+          fi
+        done
+        if [ "$wifi_enabled" -ne 0 ]; then
+          exit 1
+        fi
         if [ -d staging_dir ]; then
           # Refresh component stamps before aggregate stamps so restored host tools and toolchains remain valid.
           tools_stamp="$(find staging_dir/host -maxdepth 2 -type f -name '.tools_compile*' -print -quit 2>/dev/null || true)"
@@ -311,6 +366,11 @@ jobs:
         cp "$OPENWRT_PATH/.config" "$ARTIFACT_PREFIX.config"
         mv config.buildinfo "$ARTIFACT_PREFIX.config.buildinfo"
         mv "$MANIFEST_FILE" "$ARTIFACT_PREFIX.manifest"
+        if grep -Eiq '(^|[[:space:]])(kmod-(ath|ath11k|cfg80211|mac80211)|ath11k-firmware|ipq-wifi|wireless-regdb|wpad|hostapd|iw|wifi-scripts|qca-nss-drv-wifi)([-._]|$)' "$ARTIFACT_PREFIX.manifest"; then
+          echo "Error: Wi-Fi package found in firmware manifest: $ARTIFACT_PREFIX.manifest" >&2
+          grep -Ei '(kmod-(ath|ath11k|cfg80211|mac80211)|ath11k-firmware|ipq-wifi|wireless-regdb|wpad|hostapd|iw|wifi-scripts|qca-nss-drv-wifi)' "$ARTIFACT_PREFIX.manifest" >&2 || true
+          exit 1
+        fi
         case "$PACKAGE_EXTENSION" in
           apk | ipk) ;;
           *)
@@ -371,16 +431,19 @@ jobs:
         name: ${{ needs.Build.outputs.artifact_name }}
         path: artifacts/firmware
 
+    - name: Generate release tag
+      id: tag
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        echo "status=success" >> $GITHUB_OUTPUT
+
     - name: Upload Firmware To Release(发布固件)
-      uses: ncipollo/release-action@v1
+      uses: softprops/action-gh-release@v3
+      if: steps.tag.outputs.status == 'success' && !cancelled()
       with:
-        name: ${{ inputs.firmware_tag }}
-        allowUpdates: true
-        replacesArtifacts: true
-        artifactErrorsFailBuild: true
-        tag: ${{ inputs.firmware_tag }}
+        tag_name: ${{ steps.tag.outputs.release_tag }}
         token: ${{ github.token }}
-        artifacts: artifacts/firmware/*
+        files: artifacts/firmware/*
         body: |
           **This is OpenWrt Firmware for ${{ inputs.firmware_tag }}**
           ### 📒 固件信息
@@ -394,6 +457,14 @@ jobs:
           - 固件内核版本：**${{ needs.Build.outputs.version_kernel }}**
           - 固件编译前最后一次➦[主源码](${{ inputs.repo_url }})更新记录
           - ${{ needs.Build.outputs.version_info }}
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      with:
+        keep_latest: 12
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   Cleanup:
     runs-on: ubuntu-24.04
