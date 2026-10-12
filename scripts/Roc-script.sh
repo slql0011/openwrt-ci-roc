@@ -335,5 +335,13 @@ fi
 # 清理 PassWall 的 chnlist 规则文件
 # echo "baidu.com"  > package/luci-app-passwall/luci-app-passwall/root/usr/share/passwall/rules/chnlist
 
+### HomeProxy ###
+if package_enabled luci-app-homeproxy; then
+  # 使用支持 sing-box 1.13 以上版本的 homeproxy
+  rm -rf feeds/luci/applications/luci-app-homeproxy
+  clone_repository https://github.com/immortalwrt/homeproxy dev package/luci-app-homeproxy
+fi
+
+
 ./scripts/feeds update -i -a
 ./scripts/feeds install -a
